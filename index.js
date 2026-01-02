@@ -97,14 +97,21 @@ client.on("clientReady", async () => {
 // ---------- AI HELPERS ----------
 async function askAI(prompt, model = "ibm-granite/granite-4.0-micro") {
   try {
+    // Instruct the model to output a single-line header first in this exact format:
+    // '<call_flag> <intent> <location>;' followed by two newlines and the normal chatbot response.
+    // Example: '1 rain Jakarta Selatan;\n\nHere's the forecast...'
+    // call_flag: '1' means the bot should call the BMKG API for the given location. '0' means no call.
+    const systemInstruction = `When you reply, based on the user's query, start with a single-line header exactly in this format:\n` +
+      `'<call_flag> <Weather|rain> <location>;' (no quotes).` +
+      `call_flag must be 1 if the user is asking for a weather forecast or anything weather related like rain or flooding or 0 if the user does not ask for it.` +
+      ` After the header, add a blank line, then the regular chat response. Example:\n` +
+      `1 rain Jakarta Selatan;\n\nHere is the forecast for Jakarta Selatan...`;
+
     const response = await hf.chatCompletion({
       model: "meta-llama/Llama-3.1-8B-Instruct",
       messages: [
+        { role: "system", content: systemInstruction },
         { role: "user", content: prompt },
-        {
-          role: "system",
-          content: "",
-        },
       ],
       max_tokens: 512,
     });
@@ -134,8 +141,41 @@ function sendLongMessage(channel, text) {
 }
 
 function findWilayahCode(cityName = "jakarta") {
-  const lower = cityName.toLowerCase();
-  return wilayahData.find((w) => w.kelurahan.toLowerCase().includes(lower));
+  // Normalize string: lowercase and remove non-alphanumeric (basic)
+  const normalize = (s = "") =>
+    String(s)
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, "")
+      .trim();
+
+  const q = normalize(cityName);
+  if (!q) return null;
+
+  // fields to try matching against, in order of granularity
+  const fields = ["kelurahan", "kecamatan", "kab_kota", "provinsi"];
+
+  // 1) direct contains match across fields
+  let found = wilayahData.find((w) =>
+    fields.some((f) => w[f] && normalize(w[f]).includes(q)),
+  );
+  if (found) return found;
+
+  // 2) try matching by tokens (e.g., 'Jakarta Selatan' -> try 'selatan')
+  const parts = q.split(/\s+/).filter(Boolean);
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const token = parts.slice(i).join(" ");
+    found = wilayahData.find((w) =>
+      fields.some((f) => w[f] && normalize(w[f]).includes(token)),
+    );
+    if (found) return found;
+  }
+
+  // 3) fallback: startsWith
+  found = wilayahData.find((w) =>
+    fields.some((f) => w[f] && normalize(w[f]).startsWith(q)),
+  );
+
+  return found || null;
 }
 
 async function earlyWarning() {
@@ -413,18 +453,111 @@ client.on("messageCreate", async (message) => {
           "💬 Please ask me something, e.g. `!askai Why does Jakarta flood often?`",
         );
       }
-
       const prompt = args.join(" ");
       message.channel.send("🤖 Thinking with science...");
       const aiResponse = await askAI(prompt);
       console.log(aiResponse);
-      if (aiResponse.length > 1800) {
-        sendLongMessage(
-          message.channel,
-          `💬 **AI (truncated to fit Discord limits):** ${aiResponse}`,
-        );
+
+      // Try to parse header in the form: '<call_flag> <intent> <location>;' e.g. '1 rain Jakarta Selatan;'
+      let header = null;
+      let body = aiResponse;
+      const headerRegex = /^([01])\s+(\S+)\s+([^;]+);/m;
+      const m = aiResponse.match(headerRegex);
+      if (m) {
+        header = {
+          callFlag: m[1],
+          intent: m[2],
+          location: m[3].trim(),
+        };
+
+        // remove header line (everything up to and including the first semicolon)
+        const idx = aiResponse.indexOf(";") + 1;
+        body = aiResponse.slice(idx).trim();
+      }
+
+      // CLI debug: show what the AI header parsed as (or none)
+      if (header) {
+        console.log("🧾 Parsed AI header:", header);
       } else {
-        message.channel.send(`💬 **AI:** ${aiResponse}`);
+        console.log("🧾 No AI header found in response.");
+      }
+
+      // If header instructs to call BMKG (callFlag === '1'), try to fetch and display weather for the location
+      if (header && header.callFlag === "1") {
+        try {
+          const wilayah = findWilayahCode(header.location || "jakarta");
+          if (!wilayah) {
+            await message.channel.send(
+              `⚠️ I couldn't find the location '${header.location}'. Showing AI response only.`,
+            );
+          } else {
+            const response = await axios.get(
+              `https://api.bmkg.go.id/publik/prakiraan-cuaca?adm4=${wilayah.kode}`,
+            );
+            const forecasts = response.data.data[0].cuaca;
+            if (forecasts && forecasts.length > 0) {
+              const current = forecasts[0][0];
+              const next3 = forecasts[0].slice(1, 5);
+
+              const weatherEmbed = new EmbedBuilder()
+                .setColor("#00BFFF")
+                .setTitle(`🌤 Weather for ${wilayah.kelurahan}, ${wilayah.kab_kota}`)
+                .setDescription(`**${current.weather_desc_en} (${current.weather_desc})**`)
+                .setThumbnail(`${current.image.replace(/ /g, "%20")}`)
+                .addFields(
+                  {
+                    name: "🌡️ Temperature",
+                    value: `${current.t}°C`,
+                    inline: true,
+                  },
+                  {
+                    name: "💧 Humidity",
+                    value: `${current.hu}%`,
+                    inline: true,
+                  },
+                  {
+                    name: "🌬️ Wind",
+                    value: `${current.ws} m/s (${current.wd})`,
+                    inline: true,
+                  },
+                  {
+                    name: "🕒 Forecast Time",
+                    value: new Date(current.local_datetime).toLocaleString("id-ID"),
+                    inline: false,
+                  },
+                  {
+                    name: `🔮 Next ${next3.length} Forecasts`,
+                    value: next3
+                      .map(
+                        (f) =>
+                          `🕒 **${new Date(f.local_datetime).toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" })}** — ${f.weather_desc} (${f.t}°C, 💧${f.hu}%)`,
+                      )
+                      .join("\n"),
+                    inline: false,
+                  },
+                )
+                .setFooter({
+                  text: "Data source: BMKG | Kingdom of Science",
+                  iconURL: "https://api-apps.bmkg.go.id/storage/icon/cuaca/cerah-pm.svg",
+                })
+                .setTimestamp();
+
+              await message.channel.send({ embeds: [weatherEmbed] });
+            } else {
+              await message.channel.send(`⚠️ No weather data found for ${header.location}.`);
+            }
+          }
+        } catch (err) {
+          console.error("❌ Weather fetch error (from askai header):", err.message);
+          await message.channel.send("⚠️ Failed to fetch weather data from BMKG.");
+        }
+      }
+
+      // Finally, send the AI body (use long-message split if necessary)
+      if (body.length > 1800) {
+        sendLongMessage(message.channel, `💬 **AI (truncated to fit Discord limits):** ${body}`);
+      } else {
+        message.channel.send(`💬 **AI:** ${body}`);
       }
       break;
 
