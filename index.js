@@ -577,6 +577,30 @@ client.on("messageCreate", async (message) => {
     case "self-destruct":
       //! we'll gonna do something here later
       break;
+    
+    case "help":
+      {
+        const helpText = `📚 **Bantuan — Perintah & Fungsi (ringkas)**
+
+- **!ping** — Cek apakah bot online.
+- **!askai <pertanyaan>** — Tanya AI mengenai apapun, termasuk cuaca.
+- **!fact** — Kirim satu science fact.
+- **!drstone** — Quote acak'.
+- **!self-destruct** — Placeholder (tidak aktif saat ini).
+
+additional test Commands:
+- **!weather <kota>** — Ambil prakiraan cuaca untuk lokasi; menggunakan fungsi findWilayahCode untuk mencocokkan nama lokasi dan memanggil API BMKG.
+- **!weatheralert** — Ambil alert nowcast dari BMKG (fungsi: earlyWarning) dan tampilkan dengan tombol navigasi.
+`;
+
+        // kirim sebagai beberapa chunk jika terlalu panjang
+        if (helpText.length > 1900) {
+          sendLongMessage(message.channel, helpText);
+        } else {
+          message.channel.send(helpText);
+        }
+      }
+      break;
 
     default:
       message.reply("⚙️ Unknown command. Try `!help`.");

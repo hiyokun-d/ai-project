@@ -1,5 +1,11 @@
 # di baca dulu
 
+# cara run AI
+
+- install npm dan semua yang dibutuhkan
+- buatlah file '.env' seperti yang ada pada .env.example
+- ketik 'node .' di terminal 
+
 # Cara berkontribusi
 
 - pastiin lu udah ada `git`
